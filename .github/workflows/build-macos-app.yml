@@ -141,12 +141,16 @@ jobs:
           set -euo pipefail
           BIN="macos/build/ReleaseLocal/Ghostty.app/Contents/MacOS/ghostty"
           test -f "$BIN"
-          if ! strings "$BIN" | grep -q "rather than deadlocking"; then
+          # grep straight out of the file. Do NOT use `strings | grep -q`:
+          # grep -q exits on the first match and closes the pipe, so strings
+          # dies with EPIPE ("failed to flush output") and, under pipefail,
+          # that reports a false negative.
+          if ! grep -a -q -F "rather than deadlocking" "$BIN"; then
             echo "::error::patch marker not found in $BIN - the build is NOT patched"
             exit 1
           fi
           echo "patch marker present in the built binary"
-          codesign -dv --verbose=2 "$BIN" 2>&1 | head -5 || true
+          codesign -dv --verbose=2 "$BIN" 2>&1 || true
 
       - name: Package app
         # ditto preserves symlinks and bundle permissions, which the Sparkle
