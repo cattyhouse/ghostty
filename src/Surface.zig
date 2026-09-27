@@ -84,6 +84,10 @@ const surface_free_poll_interval: u64 = 10;
 /// values.
 id: u64,
 
+/// Set by `deinit` when a thread of ours could not be stopped, meaning this
+/// surface must be leaked rather than freed. See `leaked`.
+surface_leaked: bool = false,
+
 /// Allocator
 alloc: Allocator,
 
@@ -820,10 +824,9 @@ pub fn init(
 
 /// Deinitialize this surface.
 ///
-/// Returns true if the surface is safe to free, false if the caller must leak
-/// it. We can only return false if a thread of ours is still running and still
-/// holds pointers into this struct; see the renderer join below.
-pub fn deinit(self: *Surface) bool {
+/// Note that this can fail to stop one of our threads and leave this surface
+/// unsafe to free; callers that own the allocation must check `leaked` after.
+pub fn deinit(self: *Surface) void {
     // Stop search thread
     if (self.search) |*s| s.deinit();
 
@@ -851,7 +854,8 @@ pub fn deinit(self: *Surface) bool {
             // The render thread is still running and still points into this
             // struct, so the caller must not free it. This leaks the io thread
             // and the pty as well, which is the price of staying responsive.
-            return false;
+            self.surface_leaked = true;
+            return;
         }
 
         self.renderer_thr.join();
@@ -891,7 +895,16 @@ pub fn deinit(self: *Surface) bool {
     self.config.deinit();
 
     log.info("surface closed id={x}", .{self.id});
-    return true;
+}
+
+/// Whether `deinit` gave up on stopping one of our threads, leaving this
+/// surface unsafe to free because that thread still holds pointers into it.
+///
+/// Callers that own the allocation must leak it in that case. This only ever
+/// returns true after a thread has failed to stop within its deadline, which
+/// in practice means CoreVideo wedged inside `CVDisplayLinkStop`.
+pub fn leaked(self: *const Surface) bool {
+    return self.surface_leaked;
 }
 
 /// Entrypoint for the renderer thread. This is a thin wrapper around

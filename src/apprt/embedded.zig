@@ -279,11 +279,13 @@ pub const App = struct {
         // Grab a surface allocation because we're going to need it.
         var surface = try self.core_app.alloc.create(Surface);
 
-        // Create the surface. On failure we normally free it, but `deinit` can
-        // report that a thread of ours is still running and still holds
-        // pointers into this allocation, in which case we must leak it.
+        // Create the surface.
         surface.init(self, opts) catch |err| {
-            if (surface.deinit()) self.core_app.alloc.destroy(surface);
+            surface.deinit();
+            // `deinit` can give up on stopping a thread of ours, which still
+            // holds pointers into this allocation. Freeing it then would be a
+            // use-after-free, so leak it instead.
+            if (!surface.leaked()) self.core_app.alloc.destroy(surface);
             return err;
         };
 
@@ -292,7 +294,12 @@ pub const App = struct {
 
     /// Close the given surface.
     pub fn closeSurface(self: *App, surface: *Surface) void {
-        if (surface.deinit()) self.core_app.alloc.destroy(surface);
+        surface.deinit();
+        if (surface.leaked()) {
+            log.err("leaking surface: one of its threads is still running", .{});
+            return;
+        }
+        self.core_app.alloc.destroy(surface);
     }
 
     pub fn redrawInspector(self: *App, surface: *Surface) void {
@@ -633,9 +640,9 @@ pub const Surface = struct {
         }
     }
 
-    /// Deinitialize this surface. Returns true if it is safe to free, false if
-    /// the caller must leak it. See `Surface.deinit`.
-    pub fn deinit(self: *Surface) bool {
+    /// Deinitialize this surface. Note that this can leave the surface unsafe
+    /// to free; check `leaked` before freeing it.
+    pub fn deinit(self: *Surface) void {
         // Shut down our inspector
         self.freeInspector();
 
@@ -646,7 +653,13 @@ pub const Surface = struct {
         self.app.core_app.deleteSurface(self);
 
         // Clean up our core surface so that all the rendering and IO stop.
-        return self.core_surface.deinit();
+        self.core_surface.deinit();
+    }
+
+    /// Whether this surface must be leaked instead of freed. See
+    /// `Surface.leaked`.
+    pub fn leaked(self: *const Surface) bool {
+        return self.core_surface.leaked();
     }
 
     /// Initialize the inspector instance. A surface can only have one
