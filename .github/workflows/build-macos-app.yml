@@ -57,6 +57,19 @@ jobs:
           tar xJf zig.tar.xz
           echo "$PWD/zig-aarch64-macos-${ZIG_VERSION}" >> "$GITHUB_PATH"
 
+      - name: Cache zig build
+        # Keyed on the dependency manifest only, so that editing sources still
+        # reuses the cached dependency compilation.
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            .zig-global-cache
+            macos/GhosttyKit.xcframework
+          key: zig-${{ runner.os }}-arm64-${{ hashFiles('build.zig.zon', 'build.zig.zon.lock', 'flake.lock') }}
+          restore-keys: |
+            zig-${{ runner.os }}-arm64-
+
       - name: Toolchain versions
         run: |
           set -euo pipefail
@@ -75,9 +88,14 @@ jobs:
           zig build -Doptimize=ReleaseFast -Demit-macos-app=false
 
       - name: Verify GhosttyKit
+        # The xcframework is written to macos/GhosttyKit.xcframework (see
+        # GhosttyXCFramework.init, .out_path), which is where the Xcode
+        # project's file reference resolves to. It is NOT under zig-out.
         run: |
           set -euo pipefail
-          ls -la zig-out/lib/GhosttyKit.xcframework
+          test -d macos/GhosttyKit.xcframework
+          ls -la macos/GhosttyKit.xcframework
+          echo "--- resources ---"
           ls -la zig-out/share
 
       - name: Build Ghostty.app
@@ -88,6 +106,8 @@ jobs:
         run: |
           set -euo pipefail
           xcodebuild -target Ghostty -configuration ReleaseLocal \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM="" \
