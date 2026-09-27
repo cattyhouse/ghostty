@@ -61,6 +61,22 @@ const min_resize_height_cells: u32 = 10;
 /// given time. `activate_key_table` calls after this are ignored.
 const max_active_key_tables = 8;
 
+/// How long `deinit` waits for the renderer thread to exit before giving up
+/// and leaking the surface, in milliseconds.
+///
+/// The renderer thread can be stuck inside a blocking call into the windowing
+/// system that can only complete with main thread cooperation (on macOS,
+/// `CVDisplayLinkStop` during a display reconfiguration). `deinit` normally
+/// runs on the main thread, so an unbounded wait there is a permanent
+/// application-wide deadlock. In practice a healthy renderer thread exits in
+/// single-digit milliseconds, so this only ever fires in the pathological
+/// case.
+const surface_free_timeout: u64 = 3000;
+
+/// How often we re-check whether the renderer thread has exited while
+/// bounded-waiting on it during `deinit`.
+const surface_free_poll_interval: u64 = 10;
+
 /// Unique ID used to identify this surface for IPC purposes. It is
 /// exposed to the commands running in surfaces as the environment variable
 /// GHOSTTY_SURFACE_ID. It must not be zero as zero is used to incicate a null
@@ -100,6 +116,11 @@ renderer_thread: rendererpkg.Thread,
 
 /// The actual thread
 renderer_thr: std.Thread,
+
+/// Set to true by the renderer thread as the last thing it does before it
+/// returns from its entrypoint. This lets `deinit` observe that the thread
+/// is on its way out without having to call `join` to find out.
+renderer_exited: std.atomic.Value(bool) = .init(false),
 
 /// Mouse state.
 mouse: Mouse,
@@ -724,8 +745,8 @@ pub fn init(
     // Start our renderer thread
     self.renderer_thr = try std.Thread.spawn(
         .{},
-        rendererpkg.Thread.threadMain,
-        .{&self.renderer_thread},
+        Surface.rendererThreadMain,
+        .{self},
     );
     self.renderer_thr.setName(global.io(), "renderer") catch {};
 
@@ -805,6 +826,26 @@ pub fn deinit(self: *Surface) void {
     {
         self.renderer_thread.stop.notify() catch |err|
             log.err("error notifying renderer thread to stop, may stall err={}", .{err});
+
+        // The render thread is allowed to make blocking calls into the
+        // windowing system. On macOS `CVDisplayLinkStop` (reached from
+        // `syncDisplayLink`) is a blocking join on CoreVideo's IO thread,
+        // and during a display reconfiguration it does not complete until
+        // the main thread services the run loop again. We are usually
+        // *on* the main thread here, so waiting for that call to finish
+        // deadlocks the entire application: the render thread needs main
+        // thread progress that we can no longer provide.
+        //
+        // So we bound the wait. If it expires we deliberately leak this
+        // surface instead of freezing forever; see `surface_free_timeout`.
+        if (!self.waitRendererExit(surface_free_timeout)) {
+            log.err(
+                "renderer thread did not exit within {d}ms, leaking surface {x} rather than deadlocking",
+                .{ surface_free_timeout, self.id },
+            );
+            return;
+        }
+
         self.renderer_thr.join();
     }
 
@@ -842,6 +883,30 @@ pub fn deinit(self: *Surface) void {
     self.config.deinit();
 
     log.info("surface closed id={x}", .{self.id});
+}
+
+/// Entrypoint for the renderer thread. This is a thin wrapper around
+/// `rendererpkg.Thread.threadMain` that records that the thread is exiting
+/// so that `deinit` can bound how long it waits for us.
+fn rendererThreadMain(self: *Surface) void {
+    rendererpkg.Thread.threadMain(&self.renderer_thread);
+    self.renderer_exited.store(true, .release);
+}
+
+/// Wait up to `timeout_ms` for the renderer thread to return from its
+/// entrypoint. Returns true if it did, false if the timeout expired.
+fn waitRendererExit(self: *Surface, timeout_ms: u64) bool {
+    var waited: u64 = 0;
+    while (!self.renderer_exited.load(.acquire)) {
+        if (waited >= timeout_ms) return false;
+        std.Io.sleep(
+            global.io(),
+            std.Io.Duration.fromMilliseconds(surface_free_poll_interval),
+            .awake,
+        ) catch return !self.renderer_exited.load(.acquire);
+        waited += surface_free_poll_interval;
+    }
+    return true;
 }
 
 /// Close this surface. This will trigger the runtime to start the

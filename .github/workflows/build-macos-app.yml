@@ -1,0 +1,147 @@
+name: Build macOS app (arm64, unsigned)
+
+# Minimal, self-contained build of a macOS arm64 Ghostty.app for local manual
+# testing on a real machine.
+#
+# Why this exists instead of reusing release-tip.yml: upstream's macOS jobs run
+# on self-hosted runners (namespace-profile-*) and depend on Cachix, Apple
+# signing certificates and notarization credentials, none of which exist in a
+# fork. This workflow uses a plain GitHub-hosted arm64 runner, the same zig
+# version upstream pins (flake.nix -> 0.16.0), and the Xcode project's
+# existing ReleaseLocal configuration, which is ad-hoc signed and carries
+# com.apple.security.cs.disable-library-validation so the app can load the
+# GhosttyKit.xcframework that we just built locally.
+#
+# The result is NOT signed, notarized or notarization-stapled. It is only
+# intended to be run locally on the machine that downloads it.
+
+on:
+  push:
+    branches:
+      - 'patch/**'
+    paths:
+      - 'src/**'
+      - 'macos/**'
+      - 'pkg/**'
+      - 'build.zig'
+      - 'build.zig.zon'
+      - '.github/workflows/build-macos-app.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # macos-26 is the arm64 (Apple Silicon) image. macos-26-intel / -large are
+    # x64 and are deliberately not used.
+    runs-on: macos-26
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Ghostty derives its build number from the commit count.
+          fetch-depth: 0
+
+      - name: Install zig
+        # Same version upstream pins in flake.nix. Installed directly rather
+        # than through nix so the workflow needs no Cachix credentials.
+        run: |
+          set -euo pipefail
+          ZIG_VERSION=0.16.0
+          curl -fsSL -o zig.tar.xz \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-macos-${ZIG_VERSION}.tar.xz"
+          tar xJf zig.tar.xz
+          echo "$PWD/zig-aarch64-macos-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Toolchain versions
+        run: |
+          set -euo pipefail
+          zig version
+          xcodebuild -version
+          sw_vers
+
+      - name: Build GhosttyKit (Zig)
+        # These are the same flags upstream's build-macos job uses. Do not add
+        # -Demit-xcframework=false: the Xcode project links
+        # GhosttyKit.xcframework out of zig-out, so the xcframework must be
+        # produced here. Metal shaders are compiled by the Metal toolchain
+        # from the selected Xcode, so this step must not run inside nix.
+        run: |
+          set -euo pipefail
+          zig build -Doptimize=ReleaseFast -Demit-macos-app=false
+
+      - name: Verify GhosttyKit
+        run: |
+          set -euo pipefail
+          ls -la zig-out/lib/GhosttyKit.xcframework
+          ls -la zig-out/share
+
+      - name: Build Ghostty.app
+        working-directory: macos
+        # ReleaseLocal is ad-hoc signed (CODE_SIGN_IDENTITY "-") with an empty
+        # DEVELOPMENT_TEAM. The overrides make that explicit so the build does
+        # not depend on any signing certificate being present on the runner.
+        run: |
+          set -euo pipefail
+          xcodebuild -target Ghostty -configuration ReleaseLocal \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            COMPILATION_CACHE_CAS_PATH="$HOME/Library/Developer/Xcode/DerivedData/CompilationCache.noindex" \
+            COMPILATION_CACHE_KEEP_CAS_DIRECTORY=YES
+
+      - name: Stamp Info.plist
+        # Mark the build so it cannot be confused with an official tip build.
+        env:
+          GHOSTTY_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          PLIST="macos/build/ReleaseLocal/Ghostty.app/Contents/Info.plist"
+          test -f "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :GhosttyCommit $GHOSTTY_COMMIT" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString patched-$GHOSTTY_COMMIT" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion 0" "$PLIST"
+          # No update feed and no automatic checks: this build is unsigned and
+          # must never try to replace itself with an official build.
+          /usr/libexec/PlistBuddy -c "Delete :SUFeedURL" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Delete :SUEnableAutomaticChecks" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Print :GhosttyCommit" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST"
+
+      - name: Verify the patch is in the binary
+        # The bounded-wait log message only exists if this build actually
+        # contains the patch, so a silent success here cannot be a stale or
+        # unpatched binary.
+        run: |
+          set -euo pipefail
+          BIN="macos/build/ReleaseLocal/Ghostty.app/Contents/MacOS/ghostty"
+          test -f "$BIN"
+          if ! strings "$BIN" | grep -q "rather than deadlocking"; then
+            echo "::error::patch marker not found in $BIN - the build is NOT patched"
+            exit 1
+          fi
+          echo "patch marker present in the built binary"
+          codesign -dv --verbose=2 "$BIN" 2>&1 | head -5 || true
+
+      - name: Package app
+        # ditto preserves symlinks and bundle permissions, which the Sparkle
+        # framework inside the bundle relies on.
+        run: |
+          set -euo pipefail
+          ditto -c -k --keepParent \
+            macos/build/ReleaseLocal/Ghostty.app \
+            Ghostty-patched-macos-arm64.zip
+          ls -la Ghostty-patched-macos-arm64.zip
+
+      - name: Upload app
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Ghostty-patched-macos-arm64-${{ github.sha }}
+          path: Ghostty-patched-macos-arm64.zip
+          retention-days: 14
+          if-no-files-found: error
