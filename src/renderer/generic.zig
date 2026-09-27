@@ -45,6 +45,95 @@ const DisplayLink = switch (builtin.os.tag) {
 
 const log = std.log.scoped(.generic_renderer);
 
+/// How long a display link gets to stop before we treat CoreVideo as wedged,
+/// in milliseconds. A healthy stop completes in microseconds.
+const display_link_stop_timeout: u64 = 2000;
+
+/// How long the routine stop on an idle frame gets. Deliberately short
+/// because the render thread is stalled for this long at most.
+const display_link_stop_timeout_idle: u64 = 250;
+
+/// How often we check whether a display link has finished stopping.
+const display_link_stop_poll_interval: u64 = 1;
+
+/// Stop (and optionally release) a display link on a separate thread, and
+/// wait for it with a deadline.
+///
+/// `CVDisplayLinkStop` is a blocking handshake: CoreVideo clears the link's
+/// running flag and then waits exactly once on a condition variable for the
+/// link's IO thread to acknowledge, without re-checking any predicate. We have
+/// measured it never returning after a display reconfiguration, with the link's
+/// IO threads parked in their idle wait.
+///
+/// Because that call used to run on the render thread, one wedge permanently
+/// disabled the entire surface: no redraws (so no cursor blink) and no input
+/// processing, while the rest of the application stayed healthy.
+///
+/// Returns false if the stop did not complete in time. The caller must then
+/// keep the link alive: it cannot be released, and nothing its output callback
+/// can reach may be freed.
+fn stopDisplayLink(
+    display_link: DisplayLink,
+    release: bool,
+    timeout_ms: u64,
+) bool {
+    if (comptime DisplayLink == void) return true;
+
+    const Job = struct {
+        display_link: DisplayLink,
+        release: bool,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(job: *@This()) void {
+            job.display_link.stop() catch {};
+            if (job.release) job.display_link.release();
+            job.done.store(true, .release);
+        }
+    };
+
+    const job = global.alloc().create(Job) catch |err| {
+        log.warn("error allocating display link stop job err={}", .{err});
+        display_link.stop() catch {};
+        if (release) display_link.release();
+        return true;
+    };
+    job.* = .{ .display_link = display_link, .release = release };
+
+    const thread = std.Thread.spawn(.{}, Job.run, .{job}) catch |err| {
+        global.alloc().destroy(job);
+        // We cannot get this off the caller's thread. Stopping inline risks
+        // blocking forever, but leaving the link running is worse for the
+        // callers that need it stopped.
+        log.err("error spawning display link stop thread, stopping inline err={}", .{err});
+        display_link.stop() catch {};
+        if (release) display_link.release();
+        return true;
+    };
+    thread.detach();
+
+    var waited: u64 = 0;
+    while (!job.done.load(.acquire)) {
+        if (waited >= timeout_ms) {
+            log.err(
+                "CVDisplayLinkStop did not return within {d}ms, continuing without vsync rather than blocking",
+                .{timeout_ms},
+            );
+            // Leak the job: the thread is still inside CoreVideo and must not
+            // write to freed memory when (if) it ever returns.
+            return false;
+        }
+        std.Io.sleep(
+            global.io(),
+            std.Io.Duration.fromMilliseconds(display_link_stop_poll_interval),
+            .awake,
+        ) catch {};
+        waited += display_link_stop_poll_interval;
+    }
+
+    global.alloc().destroy(job);
+    return true;
+}
+
 /// Create a renderer type with the provided graphics API wrapper.
 ///
 /// The graphics API wrapper must provide the interface outlined below.
@@ -222,6 +311,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// sync with the display. This is void on platforms that
         /// don't support a display link.
         display_link: ?DisplayLink = null,
+
+        /// Set once a display link has failed to stop. CoreVideo is then in a
+        /// state we cannot recover from, so we never touch the link again, we
+        /// never release it, and nothing its output callback can reach may be
+        /// freed. Rendering continues on the event-driven path.
+        display_link_dead: bool = false,
 
         /// Health of the most recently completed frame.
         health: std.atomic.Value(Health) = .{ .raw = .healthy },
@@ -833,8 +928,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             if (DisplayLink != void) {
                 if (self.display_link) |display_link| {
-                    display_link.stop() catch {};
-                    display_link.release();
+                    if (self.display_link_dead) {
+                        // Already known to be wedged inside CoreVideo.
+                        // Releasing blocks on the same handshake, and the
+                        // link's output callback may still fire, so leaking
+                        // it is the only safe option.
+                        log.err("leaking display link that could not be stopped", .{});
+                    } else if (!stopDisplayLink(display_link, true, display_link_stop_timeout)) {
+                        self.display_link_dead = true;
+                    }
                 }
             }
 
@@ -924,7 +1026,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // If we don't support a display link we have no work to do.
             if (comptime DisplayLink == void) return;
 
-            self.syncDisplayLink(null, &thr.draw_now);
+            self.syncDisplayLink(null, thr.draw_now);
         }
 
         /// Called by renderer.Thread when it exits the main loop.
@@ -941,7 +1043,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // that we either never started it or the view its attached to
             // is gone which is fine.
             const display_link = self.display_link orelse return;
-            display_link.stop() catch {};
+            if (!stopDisplayLink(display_link, false, display_link_stop_timeout)) {
+                // This is not okay: the link's output callback references the
+                // render thread's `draw_now`, and it may still fire. Record it
+                // so that the link is never released and `draw_now` is never
+                // freed.
+                self.display_link_dead = true;
+            }
         }
 
         /// This is called by the GTK apprt after the surface is
@@ -1142,8 +1250,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// That is the only way to trigger a drawFrame.
         pub fn hasVsync(self: *const Self) bool {
             if (comptime DisplayLink == void) return false;
+            if (self.display_link_dead) return false;
             const display_link = self.display_link orelse return false;
             return display_link.isRunning();
+        }
+
+        /// Whether it is safe to free anything the display link's output
+        /// callback can reach, and to release the link itself.
+        ///
+        /// This is false only after `CVDisplayLinkStop` has failed to return.
+        /// Callers must then leak that memory instead, because the display
+        /// link can still invoke the callback.
+        pub fn displayLinkStopped(self: *const Self) bool {
+            if (comptime DisplayLink == void) return true;
+            return !self.display_link_dead;
         }
 
         /// Callback when the focus changes for the terminal this is rendering.
@@ -1227,6 +1347,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ) void {
             if (comptime DisplayLink == void) return;
 
+            // Once a display link has failed to stop, CoreVideo is in a state
+            // we cannot recover from, so leave the link alone. Rendering falls
+            // back to the event-driven path, which is the same thing that
+            // already happens whenever the link is not running.
+            if (self.display_link_dead) return;
+
             const display_link = self.display_link orelse display_link: {
                 if (!self.config.vsync) return;
                 const callback = draw_now orelse return;
@@ -1269,8 +1395,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (!display_link.isRunning()) {
                     display_link.start() catch {};
                 }
-            } else {
-                display_link.stop() catch {};
+            } else if (display_link.isRunning()) {
+                // Never call `CVDisplayLinkStop` directly on the render
+                // thread: see `stopDisplayLink`. If it does not return we keep
+                // rendering without vsync instead of losing the surface.
+                if (!stopDisplayLink(
+                    display_link,
+                    false,
+                    display_link_stop_timeout_idle,
+                )) {
+                    self.display_link_dead = true;
+                }
             }
         }
 

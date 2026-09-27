@@ -818,7 +818,12 @@ pub fn init(
     app.first = false;
 }
 
-pub fn deinit(self: *Surface) void {
+/// Deinitialize this surface.
+///
+/// Returns true if the surface is safe to free, false if the caller must leak
+/// it. We can only return false if a thread of ours is still running and still
+/// holds pointers into this struct; see the renderer join below.
+pub fn deinit(self: *Surface) bool {
     // Stop search thread
     if (self.search) |*s| s.deinit();
 
@@ -843,7 +848,10 @@ pub fn deinit(self: *Surface) void {
                 "renderer thread did not exit within {d}ms, leaking surface {x} rather than deadlocking",
                 .{ surface_free_timeout, self.id },
             );
-            return;
+            // The render thread is still running and still points into this
+            // struct, so the caller must not free it. This leaks the io thread
+            // and the pty as well, which is the price of staying responsive.
+            return false;
         }
 
         self.renderer_thr.join();
@@ -883,6 +891,7 @@ pub fn deinit(self: *Surface) void {
     self.config.deinit();
 
     log.info("surface closed id={x}", .{self.id});
+    return true;
 }
 
 /// Entrypoint for the renderer thread. This is a thin wrapper around

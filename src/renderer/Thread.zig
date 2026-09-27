@@ -55,7 +55,11 @@ animation_wake: rendererpkg.Renderer.AnimationWake.Kind = .draw,
 
 /// This async is used to force a draw immediately. This does not
 /// coalesce like the wakeup does.
-draw_now: xev.Async,
+///
+/// Heap allocated rather than stored inline: this is the userdata of the
+/// display link's output callback, which can outlive this thread if the
+/// display link cannot be stopped. See `deinit`.
+draw_now: *xev.Async,
 draw_now_c: xev.Completion = .{},
 
 /// The timer used for cursor blinking
@@ -136,8 +140,11 @@ pub fn init(
     var render_h = try xev.Timer.init();
     errdefer render_h.deinit();
 
-    // Draw now async, see comments.
-    var draw_now = try xev.Async.init();
+    // Draw now async, see comments. Heap allocated because the display link's
+    // output callback points at it and can outlive this thread.
+    const draw_now = try alloc.create(xev.Async);
+    errdefer alloc.destroy(draw_now);
+    draw_now.* = try xev.Async.init();
     errdefer draw_now.deinit();
 
     // Setup a timer for blinking the cursor
@@ -178,7 +185,20 @@ pub fn deinit(self: *Thread) void {
     self.stop.deinit();
     self.wakeup.deinit();
     self.render_h.deinit();
-    self.draw_now.deinit();
+
+    // `draw_now` is the userdata of the display link's output callback. If the
+    // renderer could not stop its display link (see `stopDisplayLink`), that
+    // callback may still fire, so freeing this would hand a live callback
+    // freed memory. Note that skipping the free is not enough on its own: the
+    // callback must not point into memory that is freed with the surface
+    // either, which is why this is heap allocated at all.
+    if (displayLinkStopped(self.renderer)) {
+        self.draw_now.deinit();
+        self.alloc.destroy(self.draw_now);
+    } else {
+        log.err("leaking draw_now: display link did not stop and may still call back", .{});
+    }
+
     self.cursor_h.deinit();
     if (comptime terminalpkg.compression_enabled)
         self.compression.deinit();
@@ -186,6 +206,14 @@ pub fn deinit(self: *Thread) void {
 
     // Nothing can possibly access the mailbox anymore, destroy it.
     self.mailbox.destroy(self.alloc);
+}
+
+/// Whether the renderer's display link stopped cleanly, i.e. whether it is safe
+/// to free memory the display link's output callback can reach. Renderers that
+/// have no display link always report true.
+fn displayLinkStopped(renderer: *rendererpkg.Renderer) bool {
+    if (!@hasDecl(rendererpkg.Renderer, "displayLinkStopped")) return true;
+    return renderer.displayLinkStopped();
 }
 
 /// The main entrypoint for the thread.
@@ -436,7 +464,7 @@ fn drainMailbox(self: *Thread) !void {
 
             .macos_display_id => |v| {
                 if (@hasDecl(rendererpkg.Renderer, "setMacOSDisplayID")) {
-                    try self.renderer.setMacOSDisplayID(v, &self.draw_now);
+                    try self.renderer.setMacOSDisplayID(v, self.draw_now);
                 }
             },
         }

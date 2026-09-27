@@ -278,19 +278,21 @@ pub const App = struct {
     fn newSurface(self: *App, opts: Surface.Options) !*Surface {
         // Grab a surface allocation because we're going to need it.
         var surface = try self.core_app.alloc.create(Surface);
-        errdefer self.core_app.alloc.destroy(surface);
 
-        // Create the surface
-        try surface.init(self, opts);
-        errdefer surface.deinit();
+        // Create the surface. On failure we normally free it, but `deinit` can
+        // report that a thread of ours is still running and still holds
+        // pointers into this allocation, in which case we must leak it.
+        surface.init(self, opts) catch |err| {
+            if (surface.deinit()) self.core_app.alloc.destroy(surface);
+            return err;
+        };
 
         return surface;
     }
 
     /// Close the given surface.
     pub fn closeSurface(self: *App, surface: *Surface) void {
-        surface.deinit();
-        self.core_app.alloc.destroy(surface);
+        if (surface.deinit()) self.core_app.alloc.destroy(surface);
     }
 
     pub fn redrawInspector(self: *App, surface: *Surface) void {
@@ -631,7 +633,9 @@ pub const Surface = struct {
         }
     }
 
-    pub fn deinit(self: *Surface) void {
+    /// Deinitialize this surface. Returns true if it is safe to free, false if
+    /// the caller must leak it. See `Surface.deinit`.
+    pub fn deinit(self: *Surface) bool {
         // Shut down our inspector
         self.freeInspector();
 
@@ -642,7 +646,7 @@ pub const Surface = struct {
         self.app.core_app.deleteSurface(self);
 
         // Clean up our core surface so that all the rendering and IO stop.
-        self.core_surface.deinit();
+        return self.core_surface.deinit();
     }
 
     /// Initialize the inspector instance. A surface can only have one
