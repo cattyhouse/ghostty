@@ -151,6 +151,23 @@ jobs:
       #
       # Order matters: nested code must be signed from the inside out, otherwise
       # signing a container invalidates the children it already sealed.
+      #
+      # The strip step below must run before this re-sign: stripping rewrites the
+      # main executable and would invalidate a signature made earlier. The later
+      # "Verify the patch" grep keeps working because strip only drops the symbol
+      # table; string literals in __TEXT are preserved.
+      - name: Strip main binary
+        run: |
+          set -euo pipefail
+          BIN="macos/build/ReleaseLocal/Ghostty.app/Contents/MacOS/ghostty"
+          test -f "$BIN"
+          echo "--- before strip ---"
+          ls -la "$BIN"
+          # Only the main executable: leave Sparkle, XPC services and the plugin
+          # untouched so their internal structure cannot break.
+          strip "$BIN"
+          echo "--- after strip ---"
+          ls -la "$BIN"
       - name: Re-sign app bundle
         run: |
           set -euo pipefail
